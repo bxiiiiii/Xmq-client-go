@@ -13,13 +13,13 @@ type Publisher struct {
 
  func NewPublisher(topic string) (*Publisher,error){
 	p := &Publisher{}
-	url := GetBrokers(topic)
-	client, err := Connect(url[0])
+	brokers := GetBrokers(topic)
+	client, err := Connect(brokers[0].url)
 	if err != nil {
 		return nil , err
 	}
 	p.client = client
-	return p, nil	
+	return p, nil
  }
 
 func (p *Publisher) publish(m *Msg) error{
@@ -30,6 +30,7 @@ func (p *Publisher) publish(m *Msg) error{
 	if err != nil {
 		return err
 	}
+	
 	select {
 	case  <- m.ch:
 		return	nil

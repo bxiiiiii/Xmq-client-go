@@ -2,13 +2,22 @@ package xmqclientgo
 
 import (
 	"bufio"
+	"crypto/rand"
 	"errors"
 	"fmt"
+	"math/big"
 	"net"
 	"net/url"
 	"sync"
 	"time"
 )
+
+func nrand() int64 {
+	max := big.NewInt(int64(1) << 62)
+	bigx, _ := rand.Int(rand.Reader, max)
+	x := bigx.Int64()
+	return x
+}
 
 type Client struct {
 	mu      sync.Mutex
@@ -20,7 +29,9 @@ type Client struct {
 	bw      *bufio.Writer
 	ps      praseState
 	op      *Options
-	fch chan bool
+	fch     chan bool
+
+	bi  Broker
 }
 
 type Options struct {
@@ -32,16 +43,23 @@ type Options struct {
 }
 
 type Msg struct {
-	topic string
-	data  []byte
+	id        int64
+	topic     string
+	data      []byte
+	mode      int
+	ch        chan bool
+	redo      int
+	partition int
 }
 
 type subcription struct {
-	name    string
-	topic   string
-	subType int
-	mcb     MsgHandler
-	mch     chan *Msg
+	name      string
+	topic     string
+	subType   int
+	mcb       MsgHandler
+	mch       chan *Msg
+	partition int
+	clients   map[string]*Client
 }
 
 type praseState struct {
@@ -75,7 +93,7 @@ const (
 	conProto   = "CONNECT %s" + _CRLF_
 	pubProto   = "PUB %s %s %s" + _CRLF_
 	subProto   = "SUB %s %s %d" + _CRLF_
-	unsubProto = "UNSUB "
+	unsubProto = "UNSUB %s"
 )
 
 const (
@@ -159,17 +177,22 @@ func (c *Client) spinUpSocketWatchers() {
 }
 
 func (c *Client) Publish(topic string, msg []byte) error {
-	return c.publish(topic, "", msg)
+	m := &Msg{}
+	m.ch = make(chan bool)
+	m.data = msg
+	m.id = nrand()
+
+	return c.publish(m)
 }
 
 const digits = "0123456789"
 
-func (c *Client) publish(topic string, reply string, msg []byte) error {
+func (c *Client) publish(m *Msg) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	msgh := c.scratch[:len(_PUB_P_)]
-	msgh = append(msgh, []byte(topic)...)
+	msgh = append(msgh, []byte(m.topic)...)
 	msgh = append(msgh, ' ')
 	// if reply != "" {
 	// 	msgh = append(msgh, []byte(reply)...)
@@ -178,8 +201,8 @@ func (c *Client) publish(topic string, reply string, msg []byte) error {
 
 	var b [12]byte
 	var i = len(b)
-	if len(msg) > 0 {
-		for l := len(msg); l > 0; l /= 10 {
+	if len(m.data) > 0 {
+		for l := len(m.data); l > 0; l /= 10 {
 			i -= 1
 			b[i] = digits[l%10]
 		}
@@ -194,7 +217,7 @@ func (c *Client) publish(topic string, reply string, msg []byte) error {
 	if _, c.err = c.bw.Write(msgh); c.err != nil {
 		return c.err
 	}
-	if _, c.err = c.bw.Write(msg); c.err != nil {
+	if _, c.err = c.bw.Write(m.data); c.err != nil {
 		return c.err
 	}
 
@@ -205,6 +228,10 @@ func (c *Client) publish(topic string, reply string, msg []byte) error {
 }
 
 type MsgHandler func(msg *Msg)
+
+func (c *Client) subscribe(sub *subcription) error {
+	return nil
+}
 
 func (c *Client) subsribe(topic string, sub string, subType int, cb MsgHandler) (*subcription, error) {
 	c.mu.Lock()

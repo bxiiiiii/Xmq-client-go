@@ -1,22 +1,24 @@
 package xmqclientgo
 
-import "errors"
+import (
+	"fmt"
+)
 
 type Subscriber struct {
-	clients map[int]*Client
+	sl map[string]*subcription
 }
 
-func NewSubscriber(topic string) (*Subscriber, error) {
+func NewSubscriber() (*Subscriber, error) {
 	s := &Subscriber{}
 
-	urls := GetBrokers(topic)
-	for _, url := range urls {
-		client, err := Connect(url)
-		if err != nil {
+	// urls := GetBrokers(topic)
+	// for _, url := range urls {
+	// 	client, err := Connect(url)
+	// 	if err != nil {
 
-		}
-		s.clients = append(s.clients, client)
-	}
+	// 	}
+	// 	s.clients = append(s.clients, client)
+	// }
 
 	return s, nil
 }
@@ -24,19 +26,33 @@ func NewSubscriber(topic string) (*Subscriber, error) {
 func (s *Subscriber) subscribe(sub *subcription) error {
 	switch sub.partition {
 	case -1:
-		for c, ok := range s.clients {
-			if !ok {
-				//todo
+		brokers := GetBrokers(sub.topic)
+		for _, b := range brokers {
+			c, err := Connect(b.url)
+			if err != nil {
+
 			}
+			sub.clients[b.name] = c
+		}
+		for _, c := range sub.clients {
 			c.subscribe(sub)
 		}
 	default:
-		c, ok := s.clients[sub.partition]
-		if !ok {
-			return errors.New("partition not exist.")
+		b := GetBroker(sub.topic, sub.partition)
+		c, err := Connect(b.url)
+		if err != nil {
+			return err
 		}
-		c.subsribe(sub)
+		sub.clients[b.name] = c
+		c.subscribe(sub)
 	}
+	s.sl[sub.name] = sub
 
 	return nil
+}
+
+func (s *Subscriber) unsubscribe(sub *subcription) {
+	for _, c := range sub.clients {
+		c.bw.WriteString(fmt.Sprintf(unsubProto, sub))
+	}
 }
