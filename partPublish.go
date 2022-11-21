@@ -1,8 +1,14 @@
 package xmqclientgo
 
 import (
-	"errors"
-	"time"
+	rc "Xmq-client-go/RegistraionCenter"
+	pb "Xmq-client-go/proto"
+
+	"fmt"
+	"net"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 // RouteMode
@@ -13,77 +19,89 @@ const (
 )
 
 type PartPublisher struct {
-	num     int
-	clients []*Client
-	// brokers map[string]*Broker
-	client map[string]*Client
+	name         string
+	clients      map[string]*Client
+	partitionNum int
 }
 
 func (p *PartPublisher) msg2part(key int64) int {
 	part := 0
-	part %= p.num
+	part %= p.partitionNum
 	return part
 }
 
-func NewPartPulisher(topic string) (*PartPublisher, error) {
-	p := &PartPublisher{}
-	// p.brokers = make(map[string]*Broker)
-	p.client = make(map[string]*Client)
+func NewPartPulisher(topic string, name string) (*PartPublisher, error) {
+	lis, err := net.Listen("tcp", cliUrl)
+	if err != nil {
+		return nil, err
+	}
+	s := grpc.NewServer()
+	pb.RegisterClientServer(s, &Client{})
+	if err := s.Serve(lis); err != nil {
+		return nil, err
+	}
 
-	brokers := GetBrokers(topic)
+	p := &PartPublisher{}
+	p.clients = make(map[string]*Client)
+
+	// TODO: use another way to get server url ?
+	brokers, err := rc.ZkCli.GetBrokers(topic)
+	if err != nil {
+		return nil, err
+	}
+
 	for _, b := range brokers {
-		client, err := Connect(b.url)
+		pName := fmt.Sprintf(partitionKey, b.TopicName, b.Partition)
+		conn, err := grpc.Dial(b.Url, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
-			// todo
+			return nil, err
 		}
-		p.clients = append(p.clients, client)
+		p.clients[pName] = &Client{conn: conn}
+
+		args := &pb.ConnectArgs{
+			Name:      name,
+			Url:       cliUrl,
+			Redo:      0,
+			Topic:     b.TopicName,
+			Partition: int32(b.Partition),
+		}
+		timeout := 1
+		_, err = p.clients[pName].Connect2serverWithRedo(args, timeout)
+		if err != nil {
+			return nil, err
+		}
+		//TODO: consider confict name
 	}
 
 	return p, nil
 }
 
 func (p *PartPublisher) publish(m *Msg) error {
-	if m.redo > MaxRedo {
-		return errors.New("match max redo")
+	timeout := 1
+	args := &pb.PublishArgs{
+		Name:    p.name,
+		Topic:   m.topic,
+		Mid:     nrand(),
+		Payload: string(m.data),
+		Redo:    0,
 	}
-	// p.client, err = Connect(url)
+
 	switch m.mode {
 	case RoundRobinPartition:
+		//todo
 	case CustomPartition:
-		for _, v := range p.clients {
-			if v.bi.id == m.partition {
-				err := v.Publish(m.topic, m.data)
-				if err != nil {
-					return err
-				}
-				select {
-				case <-m.ch:
-					return nil
-				case <-time.After(3 * time.Second):
-					m.redo++
-					p.publish(m)
-				}
-				break
-			}
-
+		args.Partition = int32(m.partition)
+		pName := fmt.Sprintf(partitionKey, m.topic, m.partition)
+		_, err := p.clients[pName].Push2serverWithRedo(args, timeout)
+		if err != nil {
+			return err
 		}
 	default:
-		partition := p.msg2part(m.id)
-		for _, v := range p.clients {
-			if v.bi.id == partition {
-				err := v.Publish(m.topic, m.data)
-				if err != nil {
-					return err
-				}
-				select {
-				case <-m.ch:
-					return nil
-				case <-time.After(3 * time.Second):
-					m.redo++
-					p.publish(m)
-				}
-				break
-			}
+		args.Partition = int32(p.msg2part(m.id))
+		pName := fmt.Sprintf(partitionKey, m.topic, args.Partition)
+		_, err := p.clients[pName].Push2serverWithRedo(args, timeout)
+		if err != nil {
+			return err
 		}
 	}
 	return nil
