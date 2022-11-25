@@ -1,108 +1,162 @@
 package xmqclientgo
 
 import (
-	rc "Xmq-client-go/RegistraionCenter"
 	pb "Xmq-client-go/proto"
+	"Xmq-client-go/queue"
+	"errors"
 
 	"fmt"
-	"net"
-
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-)
-
-// RouteMode
-const (
-	RoundRobinPartition = iota
-	SinglePartition
-	CustomPartition
 )
 
 type PartPublisher struct {
-	name         string
-	clients      map[string]*Client
-	partitionNum int
+	fullName           string
+	Opt                PublisherOpt
+	clients            map[string]*Client
+	asyncSends       map[string]*AsyncSend
+	partition2fullname map[int]string
+}
+
+type AsyncSend struct {
+	AsyncSendQueue *queue.Queue
+	asyncSendCh    chan bool
 }
 
 func (p *PartPublisher) msg2part(key int64) int {
 	part := 0
-	part %= p.partitionNum
+	part %= int(p.Opt.partitionNum)
 	return part
 }
 
-func NewPartPulisher(topic string, name string) (*PartPublisher, error) {
-	lis, err := net.Listen("tcp", cliUrl)
-	if err != nil {
-		return nil, err
-	}
-	s := grpc.NewServer()
-	pb.RegisterClientServer(s, &Client{})
-	if err := s.Serve(lis); err != nil {
-		return nil, err
-	}
+func NewPartPulisher(srvUrl string, host string, port int, name string, topic string, partition int, opt ...PubOption) *PartPublisher {
+	Option := default_publisher
+	Option.srvUrl = srvUrl
+	Option.host = host
+	Option.port = port
+	Option.name = name
+	Option.topic = topic
+	Option.partitionNum = int32(partition)
 
-	p := &PartPublisher{}
-	p.clients = make(map[string]*Client)
-
-	// TODO: use another way to get server url ?
-	brokers, err := rc.ZkCli.GetBrokers(topic)
-	if err != nil {
-		return nil, err
+	for _, o := range opt {
+		o.set(&Option)
 	}
 
-	for _, b := range brokers {
-		pName := fmt.Sprintf(partitionKey, b.TopicName, b.Partition)
-		conn, err := grpc.Dial(b.Url, grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err != nil {
-			return nil, err
-		}
-		p.clients[pName] = &Client{conn: conn}
-
-		args := &pb.ConnectArgs{
-			Name:      name,
-			Url:       cliUrl,
-			Redo:      0,
-			Topic:     b.TopicName,
-			Partition: int32(b.Partition),
-		}
-		timeout := 1
-		_, err = p.clients[pName].Connect2serverWithRedo(args, timeout)
-		if err != nil {
-			return nil, err
-		}
-		//TODO: consider confict name
+	p := &PartPublisher{
+		Opt:       Option,
+		clients:   make(map[string]*Client),
+		asyncSends: make(map[string]*AsyncSend),
+		partition2fullname: make(map[int]string),
 	}
-
-	return p, nil
+	return p
 }
 
-func (p *PartPublisher) publish(m *Msg) error {
-	timeout := 1
+func (p *PartPublisher) Connect() error {
+	cliUrl := fmt.Sprintf("%v:%v", p.Opt.host, p.Opt.port)
+	for i := 1; i <= int(p.Opt.partitionNum); i++ {
+		client := &Client{}
+		name, err := client.Connect(p.Opt.srvUrl, cliUrl, p.Opt.name, p.Opt.topic, int32(i), p.Opt.ConnectTimeout)
+		if err != nil {
+			if derr := p.disconnect(); derr != nil {
+				return err
+			}
+			return err
+		}
+		p.clients[name] = client
+		p.asyncSends[name].AsyncSendQueue = queue.New()
+		p.asyncSends[name].asyncSendCh = make(chan bool, p.Opt.AsyncMaxSendBufSize)
+		p.partition2fullname[i] = name
+	}
+
+	for _, v := range p.asyncSends {
+		go p.asyncPush(v)
+	}
+
+	return nil
+}
+
+func (p *PartPublisher) Publish(m *Msg) error {
 	args := &pb.PublishArgs{
-		Name:    p.name,
 		Topic:   m.topic,
 		Mid:     nrand(),
 		Payload: string(m.data),
 		Redo:    0,
 	}
 
-	switch m.mode {
-	case RoundRobinPartition:
-		//todo
-	case CustomPartition:
-		args.Partition = int32(m.partition)
-		pName := fmt.Sprintf(partitionKey, m.topic, m.partition)
-		_, err := p.clients[pName].Push2serverWithRedo(args, timeout)
-		if err != nil {
-			return err
-		}
+	switch m.partition {
+	case -1:
+		args.Partition = int32(p.msg2part(args.Mid))
+		// todo: update mid... to msg ?
 	default:
-		args.Partition = int32(p.msg2part(m.id))
-		pName := fmt.Sprintf(partitionKey, m.topic, args.Partition)
-		_, err := p.clients[pName].Push2serverWithRedo(args, timeout)
-		if err != nil {
+		if m.partition > int(p.Opt.partitionNum) {
+			return errors.New(fmt.Sprintf("topic/partition %v does not exist", m.partition))
+		}
+		args.Partition = int32(m.partition)
+	}
+
+	for k, v := range p.clients {
+		if v.Partition == args.Partition {
+			args.Name = k
+		}
+	}
+	if args.Name == "" {
+		return errors.New(fmt.Sprintf("connection with topic/partition %v does not exist", args.Partition))
+	}
+	_, err := p.clients[args.Name].Push2serverWithRedo(args, p.Opt.OperationTimeout)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (p *PartPublisher) disconnect() error {
+	for _, v := range p.clients {
+		if err := v.DisConnect(); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// callback ?
+func (p *PartPublisher) AsyncPublish(m *Msg) error {
+	args := &pb.PublishArgs{
+		Topic:   m.topic,
+		Mid:     nrand(),
+		Payload: string(m.data),
+		Redo:    0,
+	}
+
+	switch m.partition {
+	case -1:
+		args.Partition = int32(p.msg2part(args.Mid))
+	default:
+		if m.partition > int(p.Opt.partitionNum) {
+			return errors.New(fmt.Sprintf("topic/partition %v does not exist", m.partition))
+		}
+		args.Partition = int32(m.partition)
+	}
+
+
+	name := p.partition2fullname[m.partition]
+	if p.asyncSends[name].AsyncSendQueue.Size() >=  p.Opt.AsyncMaxSendBufSize{
+		return errors.New("AsyncMaxSendBufSize is full")
+	}
+	return nil
+}
+
+func (p *PartPublisher) push(*Client){
+	
+}
+
+func (p *PartPublisher) asyncPush(as *AsyncSend) {
+	for {
+		<-as.asyncSendCh
+		for !as.AsyncSendQueue.Empty() {
+			m := as.AsyncSendQueue.Front()
+			if err := p.Publish(m.(*Msg)); err != nil {
+				//todo
+			}
+			as.AsyncSendQueue.Pop()
+		}
+	}
 }

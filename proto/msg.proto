@@ -14,11 +14,29 @@ service Server {
   rpc MsgAck(MsgAckArgs) returns (MsgAckReply) {}
 
   rpc LookUp(LookUpArgs) returns (LookUpReply) {}
+  rpc RequestAlloc(RequestAllocArgs) returns (RequestAllocReply) {}
 }
 
 service Client {
   rpc Msg(MsgArgs) returns (MsgReply) {}
   rpc Ack2puber(Ack2puberArgs) returns (Ack2puberReply) {}
+}
+
+message LookUpArgs {
+  string name = 1;
+  string topic = 2;
+  int32 partition = 3;
+  int32 redo = 4;
+}
+
+message LookUpReply {
+  string url = 1;
+}
+
+message RequestAllocArgs {}
+
+message RequestAllocReply {
+  string url = 1;
 }
 
 message ConnectArgs {
@@ -27,11 +45,12 @@ message ConnectArgs {
   int32 redo = 3;
   string topic = 4;
   int32 partition = 5;
+  int32 type = 6;
+  int32 timeout = 7;
 }
 
 message ConnectReply {
-  string error = 1;
-  string name = 2;
+  string name = 1;
 }
 
 message SubscribeArgs {
@@ -46,7 +65,7 @@ message SubscribeArgs {
   int32 partition = 3;
   string subscription = 4;
   SubType subType = 5;
-  // key
+  int32 key = 6;
   uint64 pushOffset = 7;
   int32 redo = 8;
 }
@@ -109,13 +128,3 @@ message MsgAckReply {}
 message Ack2puberArgs {}
 
 message Ack2puberReply {}
-
-message LookUpArgs {
-  string name = 1;
-  string topic = 2;
-  string partition = 3;
-}
-
-message LookUpReply {
-  string url = 1;
-}

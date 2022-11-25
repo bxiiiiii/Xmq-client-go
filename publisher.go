@@ -1,98 +1,94 @@
 package xmqclientgo
 
 import (
-	rc "Xmq-client-go/RegistraionCenter"
 	pb "Xmq-client-go/proto"
-
-	"flag"
-	"net"
-
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
+	"Xmq-client-go/queue"
+	"errors"
+	"fmt"
 )
 
 type Publisher struct {
-	name   string
-	client *Client
-	zkCli  rc.ZkClient
+	fullName  string
+	Opt       PublisherOpt
+	client    *Client
+	asyncSend *AsyncSend
 }
 
-const (
-	defaultName = "world"
-)
+func NewPublisher(srvUrl string, host string, port int, name string, topic string, opt ...PubOption) (*Publisher, error) {
+	Option := default_publisher
+	Option.srvUrl = srvUrl
+	Option.host = host
+	Option.port = port
+	Option.name = name
+	Option.topic = topic
 
-var (
-	addr = flag.String("addr", "localhost:50051", "the address to connect to")
-	name = flag.String("name", defaultName, "Name to greet")
-)
-
-const MaxRedo = 3
-
-func NewPublisher(name string, topic string) (*Publisher, error) {
-	lis, err := net.Listen("tcp", cliUrl)
-	if err != nil {
-		return nil, err
+	for _, o := range opt {
+		o.set(&Option)
 	}
-	s := grpc.NewServer()
-	pb.RegisterClientServer(s, &Client{})
-	if err := s.Serve(lis); err != nil {
-		return nil, err
-	}
-	// should let server do ?
-	// start
-	p := &Publisher{}
-	isExists, err := rc.ZkCli.IsTopicExists(topic)
-	if err != nil {
-		return nil, err
+	if Option.partitionNum != 1 {
+		return nil, errors.New("partitionNum out of range")
 	}
 
-	if !isExists {
-		tnode := rc.TopicNode{
-			Name: topic,
-			Pnum: 1,
-		}
-		if err := rc.ZkCli.RegisterTnode(tnode); err != nil {
-			return nil, err
-		}
+	as := &AsyncSend{
+		AsyncSendQueue: queue.New(),
+		asyncSendCh:    make(chan bool, Option.AsyncMaxSendBufSize),
 	}
-	// end
-	// TODO: use another way to get server url ?
-	brokers, err := p.zkCli.GetBrokers(topic)
-	if err != nil {
-		return nil, err
+	p := &Publisher{
+		Opt:       Option,
+		asyncSend: as,
 	}
-
-	conn, err := grpc.Dial(brokers[0].Url, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return nil, err
-	}
-	p.client = &Client{conn: conn}
-	args := &pb.ConnectArgs{
-		Name: name,
-		Url:  cliUrl,
-		Redo: 0,
-	}
-	reply, err := p.client.Connect2serverWithRedo(args, 1)
-	if err != nil {
-		return nil, err
-	}
-	p.name = reply.Name
-	// log
+	p.client.OperationMaxRedoNum = int32(Option.OperationMaxRedoNum)
 	return p, nil
 }
 
-func (p *Publisher) publish(m *Msg) error {
+func (p *Publisher) Connect() error {
+	cliUrl := fmt.Sprintf("%v:%v", p.Opt.host, p.Opt.port)
+	name, err := p.client.Connect(p.Opt.srvUrl, cliUrl, p.Opt.name, p.Opt.topic, int32(p.Opt.partitionNum), p.Opt.ConnectTimeout)
+	if err != nil {
+		return err
+	}
+	p.fullName = name
+
+	go p.asyncPush()
+
+	return nil
+}
+
+func (p *Publisher) Publish(m *Msg) error {
 	args := &pb.PublishArgs{
-		Name:      p.name,
+		Name:      p.fullName,
 		Topic:     m.topic,
 		Partition: int32(m.partition),
 		Mid:       nrand(),
 		Payload:   string(m.data),
 		Redo:      0,
 	}
-	_, err := p.client.Push2serverWithRedo(args, 0)
+	_, err := p.client.Push2serverWithRedo(args, p.Opt.OperationTimeout)
 	if err != nil {
 		return err
 	}
 	return nil
+}
+
+// callback ?
+func (p *Publisher) AsyncPublish(m *Msg) error {
+	if p.asyncSend.AsyncSendQueue.Size() >= p.Opt.AsyncMaxSendBufSize {
+		return errors.New("AsyncMaxSendBufSize is full")
+	}
+	p.asyncSend.AsyncSendQueue.Push(m)
+	p.asyncSend.asyncSendCh <- true
+	return nil
+}
+
+func (p *Publisher) asyncPush() {
+	for {
+		<-p.asyncSend.asyncSendCh
+		for !p.asyncSend.AsyncSendQueue.Empty() {
+			m := p.asyncSend.AsyncSendQueue.Front()
+			if err := p.Publish(m.(*Msg)); err != nil {
+				// todo
+			}
+			p.asyncSend.AsyncSendQueue.Pop()
+		}
+	}
 }

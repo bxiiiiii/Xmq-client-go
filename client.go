@@ -6,17 +6,19 @@ import (
 	"crypto/rand"
 	"errors"
 	"math/big"
+	"net"
 	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 )
 
 type Client struct {
-	topic     string
-	partition int
-	conn      *grpc.ClientConn
+	Partition           int32
+	OperationMaxRedoNum int32
+	conn                *grpc.ClientConn
 
 	pb.UnimplementedClientServer
 }
@@ -25,15 +27,10 @@ type Msg struct {
 	id        int64
 	topic     string
 	data      []byte
-	mode      int
 	ch        chan bool
 	redo      int
 	partition int
 }
-
-var (
-	cliUrl = "localhost:8888"
-)
 
 const (
 	subcriptionKey = "%s/p%d/%s" // topic/partition/subcriptionName
@@ -41,8 +38,108 @@ const (
 	partitionKey   = "%s/p%d"    //topic/partition
 )
 
+type PublishMode int32
+
+type SubscribeMode int32
+
+type RouteMode int32
+
+const (
+	PMode_Exclusive     PublishMode = 0
+	PMode_WaitExclusive PublishMode = 1
+	PMode_Shared        PublishMode = 2
+)
+
+const (
+	SMode_Exclusive SubscribeMode = 0
+	SMode_Failover  SubscribeMode = 1
+	SMode_Shard     SubscribeMode = 2
+	SMode_KeyShard  SubscribeMode = 3
+)
+
+const (
+	RMode_RoundRobinPartition RouteMode = 0
+	RMode_CustomPartition     RouteMode = 1
+)
+
+func (c *Client) Msg(ctx context.Context, args *pb.MsgArgs) (*pb.MsgReply, error) {
+	reply := &pb.MsgReply{}
+
+	return reply, nil
+}
+
+func (c *Client) Connect(srvUrl string, cliUrl string, name string, topic string, partition int32, ConnectTimeout int) (string, error) {
+	lis, err := net.Listen("tcp", cliUrl)
+	if err != nil {
+		return "", err
+	}
+
+	s := grpc.NewServer()
+	pb.RegisterClientServer(s, &Client{})
+	if err := s.Serve(lis); err != nil {
+		return "", err
+	}
+
+	lconn, err := grpc.Dial(srvUrl, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return "nil", err
+	}
+	lookUpArgs := &pb.LookUpArgs{
+		Name:      name,
+		Topic:     topic,
+		Partition: partition,
+	}
+	lookUpReply, err := c.LookUpWithRedo(lookUpArgs, ConnectTimeout)
+	if err != nil {
+		if c.GetErrorString(err) == "need to connect leader to alloc" {
+			//alloc
+		}
+		return "nil", err
+	}
+	lconn.Close()
+
+	conn, err := grpc.Dial(lookUpReply.Url, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return "nil", err
+	}
+	c.conn = conn
+	args := &pb.ConnectArgs{
+		Name: name,
+		Url:  cliUrl,
+		Redo: 0,
+	}
+	reply, err := c.Connect2serverWithRedo(args, ConnectTimeout)
+	if err != nil {
+		return "", err
+	}
+	return reply.Name, nil
+}
+
+func (c *Client) LookUpWithRedo(args *pb.LookUpArgs, timeout int) (*pb.LookUpReply, error) {
+	if args.Redo >= c.OperationMaxRedoNum {
+		return nil, errors.New("match max redo")
+	}
+
+	reply, err := c.LookUpForServer(args, timeout)
+	if err != nil {
+		if ok := c.CheckTimeout(err); ok {
+			args.Redo++
+			return c.LookUpWithRedo(args, timeout)
+		}
+		return nil, err
+	}
+	return reply, nil
+}
+
+func (c *Client) LookUpForServer(args *pb.LookUpArgs, timeout int) (*pb.LookUpReply, error) {
+	cli := pb.NewServerClient(c.conn)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*time.Duration(timeout))
+	defer cancel()
+	return cli.LookUp(ctx, args)
+}
+
 func (c *Client) Connect2serverWithRedo(args *pb.ConnectArgs, timeout int) (*pb.ConnectReply, error) {
-	if args.Redo >= MaxRedo {
+	if args.Redo >= c.OperationMaxRedoNum {
 		return nil, errors.New("match max redo")
 	}
 
@@ -65,7 +162,7 @@ func (c *Client) Connet2server(args *pb.ConnectArgs, timeout int) (*pb.ConnectRe
 }
 
 func (c *Client) Push2serverWithRedo(args *pb.PublishArgs, timeout int) (*pb.PublishReply, error) {
-	if args.Redo >= MaxRedo {
+	if args.Redo >= c.OperationMaxRedoNum {
 		return nil, errors.New("match max redo")
 	}
 
@@ -87,7 +184,7 @@ func (c *Client) Push2server(args *pb.PublishArgs, timeout int) (*pb.PublishRepl
 }
 
 func (c *Client) SubscribeWithRedo(args *pb.SubscribeArgs, timeout int) (*pb.SubscribeReply, error) {
-	if args.Redo >= MaxRedo {
+	if args.Redo >= c.OperationMaxRedoNum {
 		return nil, errors.New("match max redo")
 	}
 
@@ -109,7 +206,7 @@ func (c *Client) Subscribe(args *pb.SubscribeArgs, timeout int) (*pb.SubscribeRe
 }
 
 func (c *Client) UnSubscribeWithRedo(args *pb.UnSubscribeArgs, timeout int) (*pb.UnSubscribeReply, error) {
-	if args.Redo >= MaxRedo {
+	if args.Redo >= c.OperationMaxRedoNum {
 		return nil, errors.New("match max redo")
 	}
 
@@ -136,6 +233,18 @@ func (c *Client) CheckTimeout(err error) bool {
 		return true
 	}
 	return false
+}
+
+func (c *Client) GetErrorString(err error) string {
+	statusErr, ok := status.FromError(err)
+	if !ok {
+		return ""
+	}
+	return statusErr.Message()
+}
+
+func (c *Client) DisConnect() error {
+	return c.conn.Close()
 }
 
 func nrand() int64 {
