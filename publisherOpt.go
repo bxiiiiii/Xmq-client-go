@@ -41,37 +41,37 @@ func (fpo *funcPubOption) set(po *PublisherOpt) {
 	fpo.f(po)
 }
 
-func WithMode(mode PublishMode) PubOption {
+func WithpMode(mode PublishMode) PubOption {
 	return newfuncPubOption(func(opt *PublisherOpt) {
 		opt.mode = mode
 	})
 }
 
-func WithConnectTimeout(timeout int) PubOption {
+func WithpConnectTimeout(timeout int) PubOption {
 	return  newfuncPubOption(func(opt *PublisherOpt) {
 		opt.ConnectTimeout = timeout
 	})
 }
 
-func WithOperationTimeout(timeout int) PubOption {
+func WithpOperationTimeout(timeout int) PubOption {
 	return newfuncPubOption(func(opt *PublisherOpt) {
 		opt.OperationTimeout = timeout
 	})
 }
 
-func WithAsyncMaxSendBufSize(size int) PubOption {
+func WithpAsyncMaxSendBufSize(size int) PubOption {
 	return newfuncPubOption(func(opt *PublisherOpt) {
 		opt.AsyncMaxSendBufSize = size
 	})
 }
 
-func WithOperationMaxRedoNum(num int) PubOption {
+func WithpOperationMaxRedoNum(num int) PubOption {
 	return newfuncPubOption(func(opt *PublisherOpt) {
 		opt.OperationMaxRedoNum = num
 	})
 }
 
-func WithPartitionNum(num int) PubOption {
+func WithpPartitionNum(num int) PubOption {
 	return newfuncPubOption(func(opt *PublisherOpt) {
 		opt.partitionNum = int32(num)
 	})

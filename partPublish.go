@@ -12,7 +12,7 @@ type PartPublisher struct {
 	fullName           string
 	Opt                PublisherOpt
 	clients            map[string]*Client
-	asyncSends       map[string]*AsyncSend
+	asyncSends         map[string]*AsyncSend
 	partition2fullname map[int]string
 }
 
@@ -41,9 +41,9 @@ func NewPartPulisher(srvUrl string, host string, port int, name string, topic st
 	}
 
 	p := &PartPublisher{
-		Opt:       Option,
-		clients:   make(map[string]*Client),
-		asyncSends: make(map[string]*AsyncSend),
+		Opt:                Option,
+		clients:            make(map[string]*Client),
+		asyncSends:         make(map[string]*AsyncSend),
 		partition2fullname: make(map[int]string),
 	}
 	return p
@@ -51,6 +51,11 @@ func NewPartPulisher(srvUrl string, host string, port int, name string, topic st
 
 func (p *PartPublisher) Connect() error {
 	cliUrl := fmt.Sprintf("%v:%v", p.Opt.host, p.Opt.port)
+	p.clients[cliUrl] = &Client{}
+	if err := p.clients[cliUrl].Listen(cliUrl); err != nil {
+		return err
+	}
+
 	for i := 1; i <= int(p.Opt.partitionNum); i++ {
 		client := &Client{}
 		name, err := client.Connect(p.Opt.srvUrl, cliUrl, p.Opt.name, p.Opt.topic, int32(i), p.Opt.ConnectTimeout)
@@ -86,7 +91,7 @@ func (p *PartPublisher) Publish(m *Msg) error {
 		args.Partition = int32(p.msg2part(args.Mid))
 		// todo: update mid... to msg ?
 	default:
-		if m.partition > int(p.Opt.partitionNum) {
+		if m.partition > int(p.Opt.partitionNum) || m.partition < 0 {
 			return errors.New(fmt.Sprintf("topic/partition %v does not exist", m.partition))
 		}
 		args.Partition = int32(m.partition)
@@ -119,33 +124,21 @@ func (p *PartPublisher) disconnect() error {
 
 // callback ?
 func (p *PartPublisher) AsyncPublish(m *Msg) error {
-	args := &pb.PublishArgs{
-		Topic:   m.topic,
-		Mid:     nrand(),
-		Payload: string(m.data),
-		Redo:    0,
+	if m.partition > int(p.Opt.partitionNum) || m.partition < -2 || m.partition == 0 {
+		return errors.New(fmt.Sprintf("topic/partition %v does not exist", m.partition))
 	}
-
-	switch m.partition {
-	case -1:
-		args.Partition = int32(p.msg2part(args.Mid))
-	default:
-		if m.partition > int(p.Opt.partitionNum) {
-			return errors.New(fmt.Sprintf("topic/partition %v does not exist", m.partition))
-		}
-		args.Partition = int32(m.partition)
-	}
-
 
 	name := p.partition2fullname[m.partition]
-	if p.asyncSends[name].AsyncSendQueue.Size() >=  p.Opt.AsyncMaxSendBufSize{
+	if p.asyncSends[name].AsyncSendQueue.Size() >= p.Opt.AsyncMaxSendBufSize {
 		return errors.New("AsyncMaxSendBufSize is full")
 	}
+	p.asyncSends[name].AsyncSendQueue.Push(m)
+	p.asyncSends[name].asyncSendCh <- true
 	return nil
 }
 
-func (p *PartPublisher) push(*Client){
-	
+func (p *PartPublisher) push(*Client) {
+
 }
 
 func (p *PartPublisher) asyncPush(as *AsyncSend) {

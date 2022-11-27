@@ -43,6 +43,10 @@ func NewPublisher(srvUrl string, host string, port int, name string, topic strin
 
 func (p *Publisher) Connect() error {
 	cliUrl := fmt.Sprintf("%v:%v", p.Opt.host, p.Opt.port)
+	if err := p.client.Listen(cliUrl); err != nil {
+		return nil
+	}
+	
 	name, err := p.client.Connect(p.Opt.srvUrl, cliUrl, p.Opt.name, p.Opt.topic, int32(p.Opt.partitionNum), p.Opt.ConnectTimeout)
 	if err != nil {
 		return err
