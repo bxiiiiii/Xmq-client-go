@@ -1,137 +1,246 @@
 package xmqclientgo
 
 import (
-	rc "Xmq-client-go/RegistraionCenter"
 	pb "Xmq-client-go/proto"
+	"Xmq-client-go/queue"
+	"context"
+	"errors"
 	"fmt"
-	"net"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-)
-
-const (
-	Exclusive = iota
-	Shared
-	Key_Shared
 )
 
 type MsgHandler func(msg *Msg)
 
 type Subscriber struct {
 	name string
+	Opt  SubscriberOpt
 	sl   map[string]*subcription
 }
 
-type subcription struct {
-	name       string
-	topic      string
-	subType    int
-	mcb        MsgHandler
-	mch        chan *Msg
-	partition  int
-	clients    map[string]*Client
-	magbuf     []Msg
-	pushOffset uint64
+type Topic struct {
+	name         string
+	partitionNum int
 }
 
-func NewSubscriber(name string) (*Subscriber, error) {
+func NewSubscriber(srvUrl string, host string, port int, name string, opt ...SuberOption) *Subscriber {
+	Option := default_subscriber
+	Option.srvUrl = srvUrl
+	Option.host = host
+	Option.port = port
+	Option.name = name
+
+	for _, o := range opt {
+		o.set(&Option)
+	}
+
 	s := &Subscriber{
 		name: name,
+		Opt:  Option,
 		sl:   make(map[string]*subcription),
 	}
 
-	return s, nil
+	return s
 }
 
-func (s *Subscriber) subscribe(sub *subcription) error {
-	lis, err := net.Listen("tcp", cliUrl)
+func (s *Subscriber) getTopic(sub *subcription) (*Topic, error) {
+	client := &Client{}
+	conn, err := grpc.Dial(s.Opt.srvUrl, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, err
+	}
+	args := &pb.GetTopicInfoArgs{
+		Topic: sub.Opt.topic.name,
+		Redo:  0,
+	}
+	client.conn = conn
+	reply, err := client.GetTopicWithRedo(args, s.Opt.OperationTimeout)
+	topic := &Topic{
+		partitionNum: int(reply.PartitionNum),
+	}
+	return topic, nil
+}
+
+func (s *Subscriber) Connect(sub *subcription) error {
+	cliUrl := fmt.Sprintf("%v:%v", s.Opt.host, s.Opt.port)
+	for i := 1; i <= sub.Opt.topic.partitionNum; i++ {
+		client := &Client{}
+		name, err := client.Connect(s.Opt.srvUrl, cliUrl, s.Opt.name, sub.Opt.topic.name, int32(i), s.Opt.ConnectTimeout)
+		if err != nil {
+			// disconnect exist
+			return err
+		}
+		sub.clients[name] = client
+		sub.receiveQueues[name].revQueue = *queue.New()
+		sub.receiveQueues[name].revCh = make(chan bool, sub.Opt.receiveQueueSize)
+		sub.partition2fullname[i] = name
+	}
+
+	return nil
+}
+
+func (s *Subscriber) Subscribe(name string, topic string, opt ...SubscipOption) error {
+	Opt := default_subscription
+	Opt.name = name
+	Opt.topic.name = topic
+
+	for _, o := range opt {
+		o.set(&Opt)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	sub := &subcription{
+		Opt:                Opt,
+		clients:            make(map[string]*Client),
+		receiveQueues:      make(map[string]*ReceiveQueue),
+		partition2fullname: make(map[int]string),
+		revQueue:           queue.New(),
+		cancel:             cancel,
+	}
+
+	cliUrl := fmt.Sprintf("%v:%v", s.Opt.host, s.Opt.port)
+	if err := sub.clients[cliUrl].Listen(cliUrl); err != nil {
+		return err
+	}
+
+	if err := s.Connect(sub); err != nil {
+		return err
+	}
+
+	s.sl[sub.Opt.name] = sub
+
+	t, err := s.getTopic(sub)
 	if err != nil {
 		return err
 	}
-	gs := grpc.NewServer()
-	pb.RegisterClientServer(gs, &Client{})
-	if err := gs.Serve(lis); err != nil {
-		return err
+	sub.Opt.topic.partitionNum = t.partitionNum
+
+	switch len(sub.Opt.partitions) {
+	case 0:
+		for i := 1; i < sub.Opt.topic.partitionNum; i++ {
+			name := sub.partition2fullname[i]
+			args := &pb.SubscribeArgs{
+				Name:         name,
+				Topic:        sub.Opt.topic.name,
+				Partition:    int32(i),
+				SubOffset:    sub.Opt.subOffset,
+				Subscription: sub.Opt.name,
+				Mode:         pb.SubscribeArgs_SubMode(sub.Opt.mode),
+				Redo:         0,
+			}
+			_, err := sub.clients[name].SubscribeWithRedo(args, s.Opt.OperationTimeout)
+			if err != nil {
+				//unsubscribe exist
+				return err
+			}
+
+			go sub.pull(ctx, i)
+			go sub.receive(ctx, i)
+		}
+	default:
+		for _, partition := range sub.Opt.partitions {
+			if partition > sub.Opt.topic.partitionNum || partition <= 0 {
+				//unsubscribe exist
+				return errors.New(fmt.Sprintf("topic/partition %v does not exist", partition))
+			}
+			name := sub.partition2fullname[partition]
+			args := &pb.SubscribeArgs{
+				Name:         name,
+				Topic:        sub.Opt.topic.name,
+				Partition:    int32(partition),
+				SubOffset:    sub.Opt.subOffset,
+				Subscription: sub.Opt.name,
+				Mode:         pb.SubscribeArgs_SubMode(sub.Opt.mode),
+				Redo:         0,
+			}
+			_, err := sub.clients[name].SubscribeWithRedo(args, s.Opt.OperationTimeout)
+			if err != nil {
+				return err
+			}
+			go sub.pull(ctx, partition)
+			go sub.receive(ctx, partition)
+		}
+	}
+	return nil
+}
+
+func (sub *subcription) pull(ctx context.Context, partition int) {
+	name := sub.partition2fullname[partition]
+	for {
+		bufSize := sub.receiveQueues[name].revQueue.Size()
+		//todo: consider 90% ?
+		args := &pb.PullArgs{
+			Name:         name,
+			Topic:        sub.Opt.topic.name,
+			Partition:    int32(partition),
+			Subscription: sub.Opt.name,
+			BufSize:      int32(bufSize),
+			Timeout:      int32(sub.Opt.pullTimeout),
+			Redo:         0,
+		}
+		_, err := sub.clients[name].PullWithRedo(args, sub.Opt.pullTimeout)
+		if err != nil {
+			//todo
+		}
+	}
+}
+
+func (sub *subcription) receive(ctx context.Context, partition int) {
+	for {
+		name := sub.partition2fullname[partition]
+		msg := <-sub.clients[name].msgCh
+		sub.revQueue.Push(msg)
+	}
+}
+
+func (sub *subcription) Receive() (*Msg, error) {
+	msg := sub.revQueue.Pop()
+	if msg == nil {
+		return nil, errors.New("no more message")
+	}
+	return msg.(*Msg), nil
+}
+
+func (s *Subscriber) Unsubscribe(sub *subcription) error {
+	if _, ok := s.sl[sub.Opt.name]; !ok {
+		return errors.New("subscription does not exist")
 	}
 
-	s.sl[sub.name] = sub
-	switch sub.partition {
-	case -1:
-		// TODO: use another way to get server url ?
-		brokers, err := rc.ZkCli.GetBrokers(sub.topic)
-		if err != nil {
-			return err
-		}
-		for _, b := range brokers {
-			if err := s.connectAndSendSub2server(sub, b); err != nil {
+	switch len(sub.Opt.partitions) {
+	case 0:
+		for i := 1; i < sub.Opt.topic.partitionNum; i++ {
+			name := sub.partition2fullname[i]
+			args := &pb.UnSubscribeArgs{
+				Name:         name,
+				Topic:        sub.Opt.topic.name,
+				Partition:    int32(i),
+				Subscription: sub.Opt.name,
+				Redo:         0,
+			}
+			_, err := sub.clients[name].UnSubscribeWithRedo(args, s.Opt.OperationTimeout)
+			if err != nil {
 				return err
 			}
 		}
 	default:
-		// TODO: use another way to get server url ?
-		b, err := rc.ZkCli.GetBroker(sub.topic, sub.partition)
-		if err != nil {
-			return err
-		}
-		if err := s.connectAndSendSub2server(sub, b); err != nil {
-			return err
-		}
-
-	}
-
-	return nil
-}
-
-func (s *Subscriber) connectAndSendSub2server(sub *subcription, b *rc.PartitionNode) error {
-	pName := fmt.Sprintf(partitionKey, b.TopicName, b.Partition)
-	conn, err := grpc.Dial(b.Url, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return err
-	}
-	s.sl[sub.name].clients[pName] = &Client{conn: conn}
-
-	cArgs := &pb.ConnectArgs{
-		Name:      s.name,
-		Url:       cliUrl,
-		Redo:      0,
-		Topic:     b.TopicName,
-		Partition: int32(b.Partition),
-	}
-	timeout := 1
-	_, err = s.sl[sub.name].clients[pName].Connect2serverWithRedo(cArgs, timeout)
-	if err != nil {
-		return err
-	}
-	//TODO: consider confict name
-
-	sArgs := &pb.SubscribeArgs{
-		Topic:        b.TopicName,
-		Partition:    int32(b.Partition),
-		Subscription: sub.name,
-		SubType:      pb.SubscribeArgs_SubType(sub.subType),
-		PushOffset:   sub.pushOffset,
-		Redo:         0,
-	}
-	_, err = s.sl[sub.name].clients[pName].SubscribeWithRedo(sArgs, timeout)
-
-	return nil
-}
-
-func (s *Subscriber) unsubscribe(sub *subcription) error {
-	for _, c := range sub.clients {
-		args := &pb.UnSubscribeArgs{
-			Name:         s.name,
-			Topic:        sub.topic,
-			Partition:    int32(sub.partition),
-			Subscription: sub.name,
-			Redo:         0,
-		}
-		timeout := 1
-		_, err := c.UnSubscribeWithRedo(args, timeout)
-		if err != nil {
-			return err
+		for _, partition := range sub.Opt.partitions {
+			name := sub.partition2fullname[partition]
+			args := &pb.UnSubscribeArgs{
+				Name:         name,
+				Topic:        sub.Opt.topic.name,
+				Partition:    int32(partition),
+				Subscription: sub.Opt.name,
+				Redo:         0,
+			}
+			_, err := sub.clients[name].UnSubscribeWithRedo(args, s.Opt.OperationTimeout)
+			if err != nil {
+				return err
+			}
 		}
 	}
+
+	delete(s.sl, sub.Opt.name)
+	sub.cancel()
 	return nil
 }
