@@ -19,24 +19,17 @@ type Client struct {
 	Partition           int32
 	OperationMaxRedoNum int32
 	conn                *grpc.ClientConn
-
+	msgCh               chan Msg
 	pb.UnimplementedClientServer
 }
 
 type Msg struct {
-	id        int64
 	topic     string
-	data      []byte
-	ch        chan bool
-	redo      int
 	partition int
+	mid       int64
+	msid      int64
+	data      []byte
 }
-
-const (
-	subcriptionKey = "%s/p%d/%s" // topic/partition/subcriptionName
-	msgKey         = "%s/p%d/%d" // topic/partition/msid
-	partitionKey   = "%s/p%d"    //topic/partition
-)
 
 type PublishMode int32
 
@@ -68,18 +61,21 @@ func (c *Client) Msg(ctx context.Context, args *pb.MsgArgs) (*pb.MsgReply, error
 	return reply, nil
 }
 
-func (c *Client) Connect(srvUrl string, cliUrl string, name string, topic string, partition int32, ConnectTimeout int) (string, error) {
+func (c *Client) Listen(cliUrl string) error {
 	lis, err := net.Listen("tcp", cliUrl)
 	if err != nil {
-		return "", err
+		return err
 	}
 
 	s := grpc.NewServer()
 	pb.RegisterClientServer(s, &Client{})
 	if err := s.Serve(lis); err != nil {
-		return "", err
+		return err
 	}
+	return nil
+}
 
+func (c *Client) Connect(srvUrl string, cliUrl string, name string, topic string, partition int32, ConnectTimeout int) (string, error) {
 	lconn, err := grpc.Dial(srvUrl, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return "nil", err
@@ -88,6 +84,7 @@ func (c *Client) Connect(srvUrl string, cliUrl string, name string, topic string
 		Name:      name,
 		Topic:     topic,
 		Partition: partition,
+		Redo:      0,
 	}
 	lookUpReply, err := c.LookUpWithRedo(lookUpArgs, ConnectTimeout)
 	if err != nil {
@@ -146,7 +143,7 @@ func (c *Client) Connect2serverWithRedo(args *pb.ConnectArgs, timeout int) (*pb.
 	reply, err := c.Connet2server(args, timeout)
 	if err != nil {
 		if ok := c.CheckTimeout(err); ok {
-			args.Redo += 1
+			args.Redo++
 			return c.Connect2serverWithRedo(args, timeout)
 		}
 		return nil, err
@@ -169,7 +166,7 @@ func (c *Client) Push2serverWithRedo(args *pb.PublishArgs, timeout int) (*pb.Pub
 	reply, err := c.Push2server(args, timeout)
 	if err != nil {
 		if ok := c.CheckTimeout(err); ok {
-			args.Redo += 1
+			args.Redo++
 			return c.Push2serverWithRedo(args, timeout)
 		}
 	}
@@ -191,7 +188,7 @@ func (c *Client) SubscribeWithRedo(args *pb.SubscribeArgs, timeout int) (*pb.Sub
 	reply, err := c.Subscribe(args, timeout)
 	if err != nil {
 		if ok := c.CheckTimeout(err); ok {
-			args.Redo += 1
+			args.Redo++
 			return c.SubscribeWithRedo(args, timeout)
 		}
 	}
@@ -205,6 +202,50 @@ func (c *Client) Subscribe(args *pb.SubscribeArgs, timeout int) (*pb.SubscribeRe
 	return cli.ProcessSub(ctx, args)
 }
 
+func (c *Client) PullWithRedo(args *pb.PullArgs, timeout int) (*pb.PullReply, error) {
+	if args.Redo >= c.OperationMaxRedoNum {
+		return nil, errors.New("match max redo")
+	}
+
+	reply, err := c.Pull(args, timeout)
+	if err != nil {
+		if ok := c.CheckTimeout(err); ok {
+			args.Redo++
+			return c.PullWithRedo(args, timeout)
+		}
+	}
+	return reply, nil
+}
+
+func (c *Client) Pull(args *pb.PullArgs, timeout int) (*pb.PullReply, error) {
+	cli := pb.NewServerClient(c.conn)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*time.Duration(timeout))
+	defer cancel()
+	return cli.ProcessPull(ctx, args)
+}
+
+func (c *Client) GetTopicWithRedo(args *pb.GetTopicInfoArgs, timeout int) (*pb.GetTopicInfoReply, error) {
+	if args.Redo >= c.OperationMaxRedoNum {
+		return nil, errors.New("match max redo")
+	}
+
+	reply, err := c.GetTopic(args, timeout)
+	if err != nil {
+		if ok := c.CheckTimeout(err); ok {
+			args.Redo++
+			return c.GetTopic(args, timeout)
+		}
+	}
+	return reply, nil
+}
+
+func (c *Client) GetTopic(args *pb.GetTopicInfoArgs, timeout int) (*pb.GetTopicInfoReply, error) {
+	cli := pb.NewServerClient(c.conn)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*time.Duration(timeout))
+	defer cancel()
+	return cli.GetTopicInfo(ctx, args)
+}
+
 func (c *Client) UnSubscribeWithRedo(args *pb.UnSubscribeArgs, timeout int) (*pb.UnSubscribeReply, error) {
 	if args.Redo >= c.OperationMaxRedoNum {
 		return nil, errors.New("match max redo")
@@ -213,7 +254,7 @@ func (c *Client) UnSubscribeWithRedo(args *pb.UnSubscribeArgs, timeout int) (*pb
 	reply, err := c.UnSubscribe(args, timeout)
 	if err != nil {
 		if ok := c.CheckTimeout(err); ok {
-			args.Redo += 1
+			args.Redo++
 			return c.UnSubscribeWithRedo(args, timeout)
 		}
 	}
@@ -252,4 +293,17 @@ func nrand() int64 {
 	bigx, _ := rand.Int(rand.Reader, max)
 	x := bigx.Int64()
 	return x
+}
+
+func (c *Client) ProcessMsg(ctx context.Context, args *pb.MsgArgs) (*pb.MsgReply, error) {
+	reply := &pb.MsgReply{}
+	msg := Msg{
+		topic:     args.Topic,
+		partition: int(args.Partition),
+		mid:       args.Mid,
+		msid:      args.Msid,
+		data:      []byte(args.Payload),
+	}
+	c.msgCh <- msg
+	return reply, nil
 }

@@ -62,20 +62,20 @@ func (s *Subscriber) getTopic(sub *subcription) (*Topic, error) {
 	return topic, nil
 }
 
-func (s *Subscriber) Connect(sub *subcription) error {
+func (s *Subscriber) Connect(sub *subcription, i int) error {
 	cliUrl := fmt.Sprintf("%v:%v", s.Opt.host, s.Opt.port)
-	for i := 1; i <= sub.Opt.topic.partitionNum; i++ {
-		client := &Client{}
-		name, err := client.Connect(s.Opt.srvUrl, cliUrl, s.Opt.name, sub.Opt.topic.name, int32(i), s.Opt.ConnectTimeout)
-		if err != nil {
-			// disconnect exist
-			return err
-		}
-		sub.clients[name] = client
-		sub.receiveQueues[name].revQueue = *queue.New()
-		sub.receiveQueues[name].revCh = make(chan bool, sub.Opt.receiveQueueSize)
-		sub.partition2fullname[i] = name
+	// for i := 1; i <= sub.Opt.topic.partitionNum; i++ {
+	client := &Client{}
+	name, err := client.Connect(s.Opt.srvUrl, cliUrl, s.Opt.name, sub.Opt.topic.name, int32(i), s.Opt.ConnectTimeout)
+	if err != nil {
+		// disconnect exist
+		return err
 	}
+	sub.clients[name] = client
+	sub.receiveQueues[name].revQueue = *queue.New()
+	sub.receiveQueues[name].revCh = make(chan bool, sub.Opt.receiveQueueSize)
+	sub.partition2fullname[i] = name
+	// }
 
 	return nil
 }
@@ -104,10 +104,6 @@ func (s *Subscriber) Subscribe(name string, topic string, opt ...SubscipOption) 
 		return err
 	}
 
-	if err := s.Connect(sub); err != nil {
-		return err
-	}
-
 	s.sl[sub.Opt.name] = sub
 
 	t, err := s.getTopic(sub)
@@ -116,9 +112,17 @@ func (s *Subscriber) Subscribe(name string, topic string, opt ...SubscipOption) 
 	}
 	sub.Opt.topic.partitionNum = t.partitionNum
 
+	// if err := s.Connect(sub); err != nil {
+	// 	return err
+	// }
+
 	switch len(sub.Opt.partitions) {
 	case 0:
 		for i := 1; i < sub.Opt.topic.partitionNum; i++ {
+			if err:=s.Connect(sub, i); err != nil {
+				return err
+			}
+
 			name := sub.partition2fullname[i]
 			args := &pb.SubscribeArgs{
 				Name:         name,
@@ -144,6 +148,11 @@ func (s *Subscriber) Subscribe(name string, topic string, opt ...SubscipOption) 
 				//unsubscribe exist
 				return errors.New(fmt.Sprintf("topic/partition %v does not exist", partition))
 			}
+
+			if err:=s.Connect(sub, i); err != nil {
+				return err
+			}
+			
 			name := sub.partition2fullname[partition]
 			args := &pb.SubscribeArgs{
 				Name:         name,
