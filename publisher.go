@@ -36,6 +36,7 @@ func NewPublisher(srvUrl string, host string, port int, name string, topic strin
 	p := &Publisher{
 		Opt:       Option,
 		asyncSend: as,
+		client:    new(Client),
 	}
 	p.client.OperationMaxRedoNum = int32(Option.OperationMaxRedoNum)
 	return p, nil
@@ -61,10 +62,10 @@ func (p *Publisher) Connect() error {
 func (p *Publisher) Publish(m *Msg) error {
 	args := &pb.PublishArgs{
 		Name:      p.fullName,
-		Topic:     m.topic,
-		Partition: int32(m.partition),
+		Topic:     m.Topic,
+		Partition: int32(m.Partition),
 		Mid:       nrand(),
-		Payload:   string(m.data),
+		Payload:   string(m.Data),
 		Redo:      0,
 	}
 	_, err := p.client.Push2serverWithRedo(args, p.Opt.OperationTimeout)

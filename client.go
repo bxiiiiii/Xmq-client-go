@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"math/big"
 	"net"
 	"time"
@@ -24,11 +25,11 @@ type Client struct {
 }
 
 type Msg struct {
-	topic     string
-	partition int
-	mid       int64
-	msid      int64
-	data      []byte
+	Topic     string
+	Partition int
+	Mid       int64
+	Msid      uint64
+	Data      []byte
 }
 
 type PublishMode int32
@@ -69,9 +70,13 @@ func (c *Client) Listen(cliUrl string) error {
 
 	s := grpc.NewServer()
 	pb.RegisterClientServer(s, &Client{})
-	if err := s.Serve(lis); err != nil {
-		return err
-	}
+
+	go func() {
+		s.Serve(lis)
+	}()
+	//if err := s.Serve(lis); err != nil {
+	//	return err
+	//}
 	return nil
 }
 
@@ -80,6 +85,8 @@ func (c *Client) Connect(srvUrl string, cliUrl string, name string, topic string
 	if err != nil {
 		return "nil", err
 	}
+	c.conn = lconn
+
 	lookUpArgs := &pb.LookUpArgs{
 		Name:      name,
 		Topic:     topic,
@@ -298,11 +305,11 @@ func nrand() int64 {
 func (c *Client) ProcessMsg(ctx context.Context, args *pb.MsgArgs) (*pb.MsgReply, error) {
 	reply := &pb.MsgReply{}
 	msg := Msg{
-		topic:     args.Topic,
-		partition: int(args.Partition),
-		mid:       args.Mid,
-		msid:      args.Msid,
-		data:      []byte(args.Payload),
+		Topic:     args.Topic,
+		Partition: int(args.Partition),
+		Mid:       args.Mid,
+		Msid:      args.Msid,
+		Data:      []byte(args.Payload),
 	}
 	c.msgCh <- msg
 	return reply, nil

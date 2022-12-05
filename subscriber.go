@@ -119,7 +119,7 @@ func (s *Subscriber) Subscribe(name string, topic string, opt ...SubscipOption) 
 	switch len(sub.Opt.partitions) {
 	case 0:
 		for i := 1; i < sub.Opt.topic.partitionNum; i++ {
-			if err:=s.Connect(sub, i); err != nil {
+			if err := s.Connect(sub, i); err != nil {
 				return err
 			}
 
@@ -149,10 +149,10 @@ func (s *Subscriber) Subscribe(name string, topic string, opt ...SubscipOption) 
 				return errors.New(fmt.Sprintf("topic/partition %v does not exist", partition))
 			}
 
-			if err:=s.Connect(sub, i); err != nil {
+			if err := s.Connect(sub, partition); err != nil {
 				return err
 			}
-			
+
 			name := sub.partition2fullname[partition]
 			args := &pb.SubscribeArgs{
 				Name:         name,

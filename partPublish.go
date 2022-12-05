@@ -80,21 +80,21 @@ func (p *PartPublisher) Connect() error {
 
 func (p *PartPublisher) Publish(m *Msg) error {
 	args := &pb.PublishArgs{
-		Topic:   m.topic,
+		Topic:   m.Topic,
 		Mid:     nrand(),
-		Payload: string(m.data),
+		Payload: string(m.Data),
 		Redo:    0,
 	}
 
-	switch m.partition {
+	switch m.Partition {
 	case -1:
 		args.Partition = int32(p.msg2part(args.Mid))
 		// todo: update mid... to msg ?
 	default:
-		if m.partition > int(p.Opt.partitionNum) || m.partition < 0 {
-			return errors.New(fmt.Sprintf("topic/partition %v does not exist", m.partition))
+		if m.Partition > int(p.Opt.partitionNum) || m.Partition < 0 {
+			return errors.New(fmt.Sprintf("topic/partition %v does not exist", m.Partition))
 		}
-		args.Partition = int32(m.partition)
+		args.Partition = int32(m.Partition)
 	}
 
 	for k, v := range p.clients {
@@ -124,11 +124,11 @@ func (p *PartPublisher) disconnect() error {
 
 // callback ?
 func (p *PartPublisher) AsyncPublish(m *Msg) error {
-	if m.partition > int(p.Opt.partitionNum) || m.partition < -2 || m.partition == 0 {
-		return errors.New(fmt.Sprintf("topic/partition %v does not exist", m.partition))
+	if m.Partition > int(p.Opt.partitionNum) || m.Partition < -2 || m.Partition == 0 {
+		return errors.New(fmt.Sprintf("topic/partition %v does not exist", m.Partition))
 	}
 
-	name := p.partition2fullname[m.partition]
+	name := p.partition2fullname[m.Partition]
 	if p.asyncSends[name].AsyncSendQueue.Size() >= p.Opt.AsyncMaxSendBufSize {
 		return errors.New("AsyncMaxSendBufSize is full")
 	}
