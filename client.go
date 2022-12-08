@@ -39,6 +39,12 @@ type SubscribeMode int32
 type RouteMode int32
 
 const (
+	Puber = iota
+	PartPuber
+	Suber
+)
+
+const (
 	PMode_Exclusive     PublishMode = 0
 	PMode_WaitExclusive PublishMode = 1
 	PMode_Shared        PublishMode = 2
@@ -80,10 +86,29 @@ func (c *Client) Listen(cliUrl string) error {
 	return nil
 }
 
-func (c *Client) Connect(srvUrl string, cliUrl string, name string, topic string, partition int32, ConnectTimeout int) (string, error) {
-	lconn, err := grpc.Dial(srvUrl, grpc.WithTransportCredentials(insecure.NewCredentials()))
+func (c *Client) Connect(srvUrl string, args *pb.ConnectArgs) (string, error) {
+	Url, err := c.lookup(srvUrl, args.Name, args.Topic, args.Partition, args.Timeout)
+	if err != nil {
+		return "", err
+	}
+
+	conn, err := grpc.Dial(Url, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return "nil", err
+	}
+	c.conn = conn
+	reply, err := c.Connect2serverWithRedo(args, int(args.Timeout))
+	if err != nil {
+		return "", err
+	}
+	return reply.Name, nil
+}
+
+func (c *Client) lookup(srvUrl string, name string, topic string, partition int32, ConnectTimeout int32) (string, error) {
+	Url := ""
+	lconn, err := grpc.Dial(srvUrl, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return "", err
 	}
 	c.conn = lconn
 
@@ -93,30 +118,34 @@ func (c *Client) Connect(srvUrl string, cliUrl string, name string, topic string
 		Partition: partition,
 		Redo:      0,
 	}
-	lookUpReply, err := c.LookUpWithRedo(lookUpArgs, ConnectTimeout)
+	lookUpReply, err := c.LookUpForServer(lookUpArgs, int(ConnectTimeout))
+	lconn.Close()
 	if err != nil {
 		if c.GetErrorString(err) == "need to connect leader to alloc" {
 			//alloc
+			aconn, err := grpc.Dial(srvUrl, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				return "", err
+			}
+			c.conn = aconn
+			allocArgs := &pb.RequestAllocArgs{
+				Topic:     topic,
+				Partition: partition,
+				Redo:      0,
+			}
+			allocReply, err := c.RequestAllocWithRedo(allocArgs, int(ConnectTimeout))
+			if err != nil {
+				return "", err
+			} else {
+				Url = allocReply.Url
+			}
 		}
-		return "nil", err
-	}
-	lconn.Close()
-
-	conn, err := grpc.Dial(lookUpReply.Url, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return "nil", err
-	}
-	c.conn = conn
-	args := &pb.ConnectArgs{
-		Name: name,
-		Url:  cliUrl,
-		Redo: 0,
-	}
-	reply, err := c.Connect2serverWithRedo(args, ConnectTimeout)
-	if err != nil {
 		return "", err
+	} else {
+		Url = lookUpReply.Url
 	}
-	return reply.Name, nil
+
+	return Url, nil
 }
 
 func (c *Client) LookUpWithRedo(args *pb.LookUpArgs, timeout int) (*pb.LookUpReply, error) {
@@ -140,6 +169,29 @@ func (c *Client) LookUpForServer(args *pb.LookUpArgs, timeout int) (*pb.LookUpRe
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*time.Duration(timeout))
 	defer cancel()
 	return cli.LookUp(ctx, args)
+}
+
+func (c *Client) RequestAllocWithRedo(args *pb.RequestAllocArgs, timeout int) (*pb.RequestAllocReply, error) {
+	if args.Redo >= c.OperationMaxRedoNum {
+		return nil, errors.New("match max redo")
+	}
+	reply, err := c.RequestAlloc2LeadServer(args, timeout)
+	if err != nil {
+		if ok := c.CheckTimeout(err); ok {
+			args.Redo++
+			return c.RequestAllocWithRedo(args, timeout)
+		}
+		return nil, err
+	}
+
+	return reply, nil
+}
+
+func (c *Client) RequestAlloc2LeadServer(args *pb.RequestAllocArgs, timeout int) (*pb.RequestAllocReply, error) {
+	cli := pb.NewServerClient(c.conn)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*time.Duration(timeout))
+	defer cancel()
+	return cli.RequestAlloc(ctx, args)
 }
 
 func (c *Client) Connect2serverWithRedo(args *pb.ConnectArgs, timeout int) (*pb.ConnectReply, error) {
@@ -303,6 +355,7 @@ func nrand() int64 {
 }
 
 func (c *Client) ProcessMsg(ctx context.Context, args *pb.MsgArgs) (*pb.MsgReply, error) {
+	fmt.Printf("Get msg from %v", args)
 	reply := &pb.MsgReply{}
 	msg := Msg{
 		Topic:     args.Topic,

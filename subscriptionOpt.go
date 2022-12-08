@@ -27,7 +27,7 @@ type SubscriptionOpt struct {
 }
 
 type ReceiveQueue struct {
-	revQueue queue.Queue
+	revQueue *queue.Queue
 	revCh    chan bool
 }
 
@@ -36,7 +36,7 @@ var default_subscription = SubscriptionOpt{
 	partitions:       []int{},
 	subOffset:        0,
 	receiveQueueSize: 100,
-	pullTimeout:      2,
+	pullTimeout:      25,
 }
 
 type SubscipOption interface {

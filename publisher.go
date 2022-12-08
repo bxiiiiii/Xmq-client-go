@@ -8,6 +8,7 @@ import (
 )
 
 type Publisher struct {
+	id        int64
 	fullName  string
 	Opt       PublisherOpt
 	client    *Client
@@ -34,6 +35,7 @@ func NewPublisher(srvUrl string, host string, port int, name string, topic strin
 		asyncSendCh:    make(chan bool, Option.AsyncMaxSendBufSize),
 	}
 	p := &Publisher{
+		id:        nrand(),
 		Opt:       Option,
 		asyncSend: as,
 		client:    new(Client),
@@ -47,8 +49,19 @@ func (p *Publisher) Connect() error {
 	if err := p.client.Listen(cliUrl); err != nil {
 		return nil
 	}
-	
-	name, err := p.client.Connect(p.Opt.srvUrl, cliUrl, p.Opt.name, p.Opt.topic, int32(p.Opt.partitionNum), p.Opt.ConnectTimeout)
+
+	args := &pb.ConnectArgs{
+		Name:         p.Opt.name,
+		Url:          cliUrl,
+		Redo:         0,
+		Topic:        p.Opt.topic,
+		Partition:    int32(p.Opt.partitionNum),
+		Type:         Puber,
+		PartitionNum: int32(p.Opt.partitionNum),
+		PubMode:      int32(p.Opt.mode),
+		Timeout:      int32(p.Opt.ConnectTimeout),
+	}
+	name, err := p.client.Connect(p.Opt.srvUrl, args)
 	if err != nil {
 		return err
 	}

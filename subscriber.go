@@ -14,6 +14,7 @@ import (
 type MsgHandler func(msg *Msg)
 
 type Subscriber struct {
+	id   int64
 	name string
 	Opt  SubscriberOpt
 	sl   map[string]*subcription
@@ -36,6 +37,7 @@ func NewSubscriber(srvUrl string, host string, port int, name string, opt ...Sub
 	}
 
 	s := &Subscriber{
+		id:   nrand(),
 		name: name,
 		Opt:  Option,
 		sl:   make(map[string]*subcription),
@@ -45,7 +47,9 @@ func NewSubscriber(srvUrl string, host string, port int, name string, opt ...Sub
 }
 
 func (s *Subscriber) getTopic(sub *subcription) (*Topic, error) {
-	client := &Client{}
+	client := &Client{
+		OperationMaxRedoNum: int32(s.Opt.OperationMaxRedoNum),
+	}
 	conn, err := grpc.Dial(s.Opt.srvUrl, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return nil, err
@@ -56,31 +60,46 @@ func (s *Subscriber) getTopic(sub *subcription) (*Topic, error) {
 	}
 	client.conn = conn
 	reply, err := client.GetTopicWithRedo(args, s.Opt.OperationTimeout)
+	if err != nil {
+		return nil, err
+	}
 	topic := &Topic{
 		partitionNum: int(reply.PartitionNum),
 	}
 	return topic, nil
 }
 
-func (s *Subscriber) Connect(sub *subcription, i int) error {
+func (s *Subscriber) connect(sub *subcription, i int) error {
 	cliUrl := fmt.Sprintf("%v:%v", s.Opt.host, s.Opt.port)
 	// for i := 1; i <= sub.Opt.topic.partitionNum; i++ {
-	client := &Client{}
-	name, err := client.Connect(s.Opt.srvUrl, cliUrl, s.Opt.name, sub.Opt.topic.name, int32(i), s.Opt.ConnectTimeout)
+	client := &Client{OperationMaxRedoNum: int32(s.Opt.OperationMaxRedoNum)}
+	args := &pb.ConnectArgs{
+		Name:         s.Opt.name,
+		Url:          cliUrl,
+		Redo:         0,
+		Topic:        sub.Opt.topic.name,
+		Partition:    int32(i),
+		Timeout:      int32(s.Opt.ConnectTimeout),
+		PartitionNum: int32(i),
+	}
+	//record
+	name, err := client.Connect(s.Opt.srvUrl, args)
 	if err != nil {
 		// disconnect exist
 		return err
 	}
 	sub.clients[name] = client
-	sub.receiveQueues[name].revQueue = *queue.New()
-	sub.receiveQueues[name].revCh = make(chan bool, sub.Opt.receiveQueueSize)
+	sub.receiveQueues[name] = &ReceiveQueue{
+		revQueue: queue.New(),
+		revCh:    make(chan bool, sub.Opt.receiveQueueSize),
+	}
 	sub.partition2fullname[i] = name
 	// }
 
 	return nil
 }
 
-func (s *Subscriber) Subscribe(name string, topic string, opt ...SubscipOption) error {
+func (s *Subscriber) Subscribe(name string, topic string, opt ...SubscipOption) (*subcription, error) {
 	Opt := default_subscription
 	Opt.name = name
 	Opt.topic.name = topic
@@ -101,14 +120,14 @@ func (s *Subscriber) Subscribe(name string, topic string, opt ...SubscipOption) 
 
 	cliUrl := fmt.Sprintf("%v:%v", s.Opt.host, s.Opt.port)
 	if err := sub.clients[cliUrl].Listen(cliUrl); err != nil {
-		return err
+		return nil, err
 	}
 
 	s.sl[sub.Opt.name] = sub
 
 	t, err := s.getTopic(sub)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	sub.Opt.topic.partitionNum = t.partitionNum
 
@@ -118,9 +137,9 @@ func (s *Subscriber) Subscribe(name string, topic string, opt ...SubscipOption) 
 
 	switch len(sub.Opt.partitions) {
 	case 0:
-		for i := 1; i < sub.Opt.topic.partitionNum; i++ {
-			if err := s.Connect(sub, i); err != nil {
-				return err
+		for i := 1; i <= sub.Opt.topic.partitionNum; i++ {
+			if err := s.connect(sub, i); err != nil {
+				return nil, err
 			}
 
 			name := sub.partition2fullname[i]
@@ -133,10 +152,13 @@ func (s *Subscriber) Subscribe(name string, topic string, opt ...SubscipOption) 
 				Mode:         pb.SubscribeArgs_SubMode(sub.Opt.mode),
 				Redo:         0,
 			}
-			_, err := sub.clients[name].SubscribeWithRedo(args, s.Opt.OperationTimeout)
+			_, err := sub.clients[name].Subscribe(args, s.Opt.OperationTimeout)
 			if err != nil {
-				//unsubscribe exist
-				return err
+				if sub.clients[name].GetErrorString(err) == "Repeat subscription" {
+					fmt.Println("Repeat subscription")
+				} else {
+					return nil, err
+				}
 			}
 
 			go sub.pull(ctx, i)
@@ -146,11 +168,11 @@ func (s *Subscriber) Subscribe(name string, topic string, opt ...SubscipOption) 
 		for _, partition := range sub.Opt.partitions {
 			if partition > sub.Opt.topic.partitionNum || partition <= 0 {
 				//unsubscribe exist
-				return errors.New(fmt.Sprintf("topic/partition %v does not exist", partition))
+				return nil, errors.New(fmt.Sprintf("topic/partition %v does not exist", partition))
 			}
 
-			if err := s.Connect(sub, partition); err != nil {
-				return err
+			if err := s.connect(sub, partition); err != nil {
+				return nil, err
 			}
 
 			name := sub.partition2fullname[partition]
@@ -165,19 +187,19 @@ func (s *Subscriber) Subscribe(name string, topic string, opt ...SubscipOption) 
 			}
 			_, err := sub.clients[name].SubscribeWithRedo(args, s.Opt.OperationTimeout)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			go sub.pull(ctx, partition)
 			go sub.receive(ctx, partition)
 		}
 	}
-	return nil
+	return sub, nil
 }
 
 func (sub *subcription) pull(ctx context.Context, partition int) {
 	name := sub.partition2fullname[partition]
 	for {
-		bufSize := sub.receiveQueues[name].revQueue.Size()
+		bufSize := sub.Opt.receiveQueueSize - sub.receiveQueues[name].revQueue.Size()
 		//todo: consider 90% ?
 		args := &pb.PullArgs{
 			Name:         name,
@@ -188,9 +210,10 @@ func (sub *subcription) pull(ctx context.Context, partition int) {
 			Timeout:      int32(sub.Opt.pullTimeout),
 			Redo:         0,
 		}
-		_, err := sub.clients[name].PullWithRedo(args, sub.Opt.pullTimeout)
+		fmt.Println("send pull to server")
+		_, err := sub.clients[name].Pull(args, sub.Opt.pullTimeout)
 		if err != nil {
-			//todo
+			fmt.Println(err)
 		}
 	}
 }

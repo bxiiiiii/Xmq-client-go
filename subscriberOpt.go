@@ -11,8 +11,8 @@ type SubscriberOpt struct {
 }
 
 var default_subscriber = SubscriberOpt{
-	ConnectTimeout:      30,
-	OperationTimeout:    30,
+	ConnectTimeout:      3,
+	OperationTimeout:    3,
 	OperationMaxRedoNum: 3,
 }
 
